@@ -76,9 +76,9 @@ set(POMP_SRCS
 )
 
 set(SOURCES
-    /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/ht_audio.c
-    /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/ht_sys.c
-    /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/audio_aac_adp.c
+    # /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/ht_audio.c
+    # /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/ht_sys.c
+    # /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/audio_aac_adp.c
     /media/luoyang/Workspace/hisi/libs/ht_hicomm/src/utils_log.c    
     )
 
@@ -86,9 +86,11 @@ set(SOURCES
 include_directories(
     ${PROJECT_SOURCE_DIR}/inc
     ${MPP_PATH}/include
-    ${MPP_PATH}/extdrv/tlv320aic31
+    # ${MPP_PATH}/extdrv/tlv320aic31
+    /media/luoyang/Workspace/hisi/libs/hink/inc
     /media/luoyang/Workspace/hisi/libs/ht_hicomm/inc
     /home/luoyang/Dev/cross/hi3531d_v600/libbcg729/include
+    /home/luoyang/Dev/cross/hi3531d_v600/opus/include    
     /home/luoyang/Dev/cross/hi3531d_v600/nanomsg/include
     )
 
@@ -96,7 +98,9 @@ include_directories(
 link_directories(
     ${MPP_PATH}/lib
     /home/luoyang/Dev/cross/hi3531d_v600/libbcg729/lib
+    /home/luoyang/Dev/cross/hi3531d_v600/opus/lib    
     /home/luoyang/Dev/cross/hi3531d_v600/nanomsg/lib
+    /media/luoyang/Workspace/hisi/libs/hink/build
     )
 
 
@@ -143,4 +147,6 @@ target_link_libraries( ${PROJECT_NAME}
     aacdec
     libbcg729.a
     nanomsg
+    hink
+    opus
     )

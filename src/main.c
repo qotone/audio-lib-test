@@ -1,3 +1,7 @@
+#include "hi_comm_aio.h"
+#include "hi_comm_video.h"
+#include "hi_common.h"
+#include "hi_type.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,169 +13,130 @@
 #include <assert.h>
 #include <signal.h>
 
+#if 0
+
 #include "ht_audio.h"
 #include "ht_hicomm.h"
 #include "ht_sys.h"
+
+#else
+
+#include "hink_comm.h"
+#include "hink_sys.h"
+#include "hink_adec.h"
+#include "hink_aenc.h"
+#include "hink_aio.h"
+
+#endif
 
 #include "nanomsg/pipeline.h"
 #include "nanomsg/nn.h"
 #include "utils_log.h"
 
 #include "g729.h"
+#include "mopus.h"
 
 
 #define NN_URL "ipc:///tmp/pipeline.ipc"
 
-#define CODEC_G729   0   //1 -- decode G729 , 0 -- decode PCM .
+//#define CODEC_G729   0   //1 -- decode G729 , 0 -- decode PCM .
+#define CODEC_TYPE_G729 1
+#define CODEC_TYPE_OPUS 2
 
-typedef struct tagSAMPLE_AENC_S
-{
-    HI_BOOL bStart;
-    pthread_t stAencPid;
-    HI_S32  AeChn;
-    HI_S32  AdChn;
-    FILE    *pfd;
-    HI_BOOL bSendAdChn;
-    int sock;
-    char file_name[64];
-} SAMPLE_AENC_S;
+#define CODEC_TYPE    CODEC_TYPE_OPUS
+#define SEND_ENCODE_DATA   1
 
-
-SAMPLE_AENC_S my_aenc;
 struct G729_codec *g729_codec = NULL;
 
-FILE *pcm_file = NULL;
+struct mopus_codec *opus_codec = NULL;
 
+struct aenc_ctx{
+    char file[64];
+    int push_socket;
+    FILE *pPFile;
+    FILE *pGFile;
+};
 
+static int audio_tick = 0;
 
-void * audio_aencProc(void *parg)
+struct aenc_ctx ctx;
+int aenc_callback(AENC_CHN aeChn,AUDIO_STREAM_S *pstrm,void *parg)
 {
-    HI_S32 s32Ret;
-    HI_S32 AencFd;
-    SAMPLE_AENC_S *pstAencCtl = (SAMPLE_AENC_S *)parg;
-    AUDIO_STREAM_S stStream;
-    fd_set read_fds;
-    struct timeval TimeoutVal;
-    int len = 0;
+    int out_size;
+    unsigned char out_buffer[640];
 
-    char audio_file[128];
+    struct aenc_ctx *pctx =(struct aenc_ctx *)parg;
 
-    unsigned char buffer[320];
+    if(pctx->pPFile == NULL){
+        char audio_file[64];
 
-    prctl(PR_SET_NAME, "hi_AencProc", 0, 0, 0);
+        snprintf(audio_file,strlen(pctx->file) + 5, "%s.pcm",pctx->file);
+        pctx->pPFile = fopen(audio_file,"w+");
+        printf("[INFO] %s:L%d,pcm file :%s\n",__FUNCTION__,__LINE__,audio_file );
 
-    FD_ZERO(&read_fds);
-    AencFd = HI_MPI_AENC_GetFd(pstAencCtl->AeChn);
-    FD_SET(AencFd, &read_fds);
-
-
-    unsigned int size;
-    unsigned char out_buffer[320];
-    unsigned char *in_buf,*out_buf;
-
-
-    while (pstAencCtl->bStart)
-    {
-        unsigned int out_size = 0;
-        TimeoutVal.tv_sec = 1;
-        TimeoutVal.tv_usec = 0;
-        FD_ZERO(&read_fds);
-        FD_SET(AencFd,&read_fds);
-        s32Ret = select(AencFd+1, &read_fds, NULL, NULL, &TimeoutVal);
-        if (s32Ret < 0){
-            break;
-        }else if (0 == s32Ret){
-            LOGE_print("%s: get aenc stream select time out\n", __FUNCTION__);
-            break;
-        }
-
-        if (FD_ISSET(AencFd, &read_fds))
-        {
-            /* get stream from aenc chn */
-            s32Ret = HI_MPI_AENC_GetStream(pstAencCtl->AeChn, &stStream, HI_FALSE);
-            if (HI_SUCCESS != s32Ret ){
-                LOGE_print("%s: HI_MPI_AENC_GetStream(%d), failed with %#x!\n",\
-                       __FUNCTION__, pstAencCtl->AeChn, s32Ret);
-                pstAencCtl->bStart = HI_FALSE;
-                return NULL;
-            }
-
-#if 0 // dirctly to adec, no use at this moment.
-            /* send stream to decoder and play for testing */
-            if (HI_TRUE == pstAencCtl->bSendAdChn){
-                s32Ret = HI_MPI_ADEC_SendStream(pstAencCtl->AdChn, &stStream, HI_TRUE);
-                if (HI_SUCCESS != s32Ret ){
-                    printf("%s: HI_MPI_ADEC_SendStream(%d), failed with %#x!\n",\
-                           __FUNCTION__, pstAencCtl->AdChn, s32Ret);
-                    pstAencCtl->bStart = HI_FALSE;
-                    return NULL;
-                }
-            }
-#endif
-            /* save audio stream to file */
-
-
-            if(pcm_file == NULL){
-
-                snprintf(audio_file,strlen(pstAencCtl->file_name) + 5, "%s.pcm",pstAencCtl->file_name);
-                pcm_file = fopen(audio_file,"w+");
-                printf("[INFO] %s:L%d,pcm file :%s\n",__FUNCTION__,__LINE__,audio_file );
-
-            }else {
-                fwrite(stStream.pStream,1,stStream.u32Len, pcm_file);
-            }
-
-            out_size = g729_encode(g729_codec, out_buffer, stStream.pStream, stStream.u32Len);
-            if(out_size > 0){
-                if(pstAencCtl->pfd == NULL){
-                    snprintf(audio_file,strlen(pstAencCtl->file_name) + 6, "%s.g729",pstAencCtl->file_name);
-                    pstAencCtl->pfd = fopen(audio_file,"w+");
-                    printf("[INFO] %s:L%d,g729 file :%s\n",__FUNCTION__,__LINE__,audio_file );
-                }
-                if(pstAencCtl->pfd)
-                    fwrite(out_buffer,1,out_size, pstAencCtl->pfd);
-            }
-            /* LOGI_print("write %d bytes\n",out_size); */
-            /* fwrite(stStream.pStream+4,1,stStream.u32Len - 4, pstAencCtl->pfd); */
-            /* LOGI_print("write %d bytes \n",stStream.u32Len -4); */
-#ifndef CODEC_G729
-            int bytes = nn_send(pstAencCtl->sock, (void *)stStream.pStream, (size_t) stStream.u32Len, 0);
-#else
-            int bytes = nn_send(pstAencCtl->sock, (void *)out_buffer, (size_t) out_size, 0);
-#endif /* !CODEC_G729 */
-
-
-
-
-            /* finally you must release the stream */
-            s32Ret = HI_MPI_AENC_ReleaseStream(pstAencCtl->AeChn, &stStream);
-            if (HI_SUCCESS != s32Ret ){
-                printf("%s: HI_MPI_AENC_ReleaseStream(%d), failed with %#x!\n",\
-                       __FUNCTION__, pstAencCtl->AeChn, s32Ret);
-                pstAencCtl->bStart = HI_FALSE;
-                return NULL;
-            }
-        }
     }
 
-    fclose(pstAencCtl->pfd);
-    if(pcm_file != NULL)
-        fclose(pcm_file);
+    if(pctx->pPFile)
+        fwrite(pstrm->pStream,1,pstrm->u32Len, pctx->pPFile);
 
-    printf("fclose ...\n");
+#if CODEC_TYPE == CODEC_TYPE_G729
+    out_size = g729_encode(g729_codec, out_buffer, pstrm->pStream, pstrm->u32Len);
 
-    pstAencCtl->bStart = HI_FALSE;
-    return NULL;
+    if(pctx->pGFile == NULL){
+        char audio_file[64];
+
+        snprintf(audio_file,strlen(pctx->file) + 6, "%s.g729",pctx->file);
+        pctx->pGFile = fopen(audio_file,"w+");
+        printf("[INFO] %s:L%d,g729 file :%s\n",__FUNCTION__,__LINE__,audio_file );
+    }
+
+    if(pctx->pGFile)
+        fwrite(out_buffer,1,out_size, pctx->pGFile);
+
+#elif CODEC_TYPE == CODEC_TYPE_OPUS
+    if((audio_tick++ % 100 ) == 0)
+        printf("[INFO] %s:L%d, before encode %lu bytes.\n",__FUNCTION__,__LINE__,pstrm->u32Len );
+    out_size = mopus_encode(opus_codec, out_buffer, pstrm->pStream, pstrm->u32Len);
+
+    if((audio_tick % 100 ) == 0)
+        printf("[INFO] %s:L%d,after encode %lu bytes.\n",__FUNCTION__,__LINE__,out_size );
+
+    if(pctx->pGFile == NULL){
+        char audio_file[64];
+
+        snprintf(audio_file,strlen(pctx->file) + 6, "%s.opus",pctx->file);
+        pctx->pGFile = fopen(audio_file,"w+");
+        printf("[INFO] %s:L%d,opus file :%s\n",__FUNCTION__,__LINE__,audio_file );
+    }
+
+    if(out_size > 0 && pctx->pGFile)
+        fwrite(out_buffer,1,out_size, pctx->pGFile);
+#else
+    printf("%s\n", "ERRROR");
+
+#endif
 
 
+
+#ifndef SEND_ENCODE_DATA
+    int bytes = nn_send(pctx->push_socket, (void *)pstrm->pStream, (size_t) pstrm->u32Len, 0);
+#else
+    int bytes = nn_send(pctx->push_socket, (void *)out_buffer, (size_t) out_size, 0);
+#endif /* !CODEC_G729 */
+
+    return 0;
 }
 
+volatile int bStart = 1;
 
 static void sig_handler(int signum)
 {
 	printf("signal %d(%s) received\n", signum, strsignal(signum));
 
-	my_aenc.bStart = 0;
+    if(bStart)
+        bStart = 0;
+    else
+        exit(-1);
 }
 
 /*
@@ -194,58 +159,57 @@ int main(int argc, char *argv[])
     char ch;
     HI_S32 s32Ret = HI_FAILURE;
 
-    AUDIO_DEV aiDev = SAMPLE_AUDIO_TLV320_AI_DEV;
+    AUDIO_DEV aiDev = HINK_AUDIO_TLV320_AI_DEV;
     AI_CHN aiChn = 0;
     AENC_CHN aeChn = 0;
 
     AIO_ATTR_S stAioAttr;
     char audio_file[128];
+    AUDIO_SAMPLE_RATE_E sample_rate = AUDIO_SAMPLE_RATE_8000;
 
 
-
+#if CODEC_TYPE == CODEC_TYPE_G729
     g729_codec = g729_init();
     if(g729_codec == NULL)
         return -1;
+#elif   CODEC_TYPE == CODEC_TYPE_OPUS
+    printf("[INFO]\tmopus_init\n");
+    opus_codec = mopus_init(16000,1);
+    if(opus_codec == NULL)
+        return -1;
 
 
-    /* Setup signal handlers */
-	signal(SIGINT, &sig_handler);
-	signal(SIGTERM, &sig_handler);
-	signal(SIGPIPE, SIG_IGN);
+        sample_rate  = AUDIO_SAMPLE_RATE_16000;
+#else
+    printf("[ERROR]\tinit...\n");
+#endif
+
 
 
     /* 初始化海思mpp系统 */
-    s32Ret = ht_sys_init();
+    HI_U32 u32BlkSize = hink_sys_calcPicVbBlkSize(VIDEO_ENCODING_MODE_AUTO, PIC_HD1080, HINK_PIXEL_FORMAT, HINK_SYS_ALIGN_WIDTH, COMPRESS_MODE_SEG);
+    s32Ret = hink_sys_init(u32BlkSize, 18);
 
-    s32Ret = HI_MPI_AENC_AacInit();
-    if(HI_SUCCESS != s32Ret)
-    {
-                printf("%s: aac aenc init failed with %d!\n", __FUNCTION__, s32Ret);
-                return HI_FAILURE;
-        }
-    s32Ret = HI_MPI_ADEC_AacInit();
-    if(HI_SUCCESS != s32Ret)
-    {
-        printf("%s: aac adec init failed with %d!\n", __FUNCTION__, s32Ret);
-        return HI_FAILURE;
-    }
 
-    ht_audio_reset();
+    hink_aenc_reset();
+    hink_adec_reset();
+    hink_ai_reset();
+    hink_ao_reset();
 
-    stAioAttr.enSamplerate = AUDIO_SAMPLE_RATE_8000;
+    stAioAttr.enSamplerate = sample_rate;
     stAioAttr.enBitwidth  = AUDIO_BIT_WIDTH_16;
     stAioAttr.enWorkmode = AIO_MODE_I2S_SLAVE; //for aio,for sil9233 in
 
     stAioAttr.enSoundmode = AUDIO_SOUND_MODE_MONO; //AUDIO_SOUND_MODE_STEREO;
     stAioAttr.u32EXFlag = 1;										//À©Õ¹³É16 Î»£¬8bitµ½16bit À©Õ¹±êÖ¾Ö»¶ÔAI²ÉÑù¾«¶ÈÎª8bit Ê±ÓÐÐ§
     stAioAttr.u32FrmNum = 30;
-    stAioAttr.u32PtNumPerFrm = SAMPLE_AUDIO_PTNUMPERFRM;//1024;//SAMPLE_AUDIO_PTNUMPERFRM;
-    stAioAttr.u32ChnCnt = 2;	// 2									//stereo mode must be 2
-    stAioAttr.u32ClkChnCnt   = 2;//2
+    stAioAttr.u32PtNumPerFrm = HINK_AUDIO_PTNUMPERFRM;//1024;//SAMPLE_AUDIO_PTNUMPERFRM;
+    stAioAttr.u32ChnCnt = 1;	// 2									//stereo mode must be 2
+    stAioAttr.u32ClkChnCnt   = 1;//2
     stAioAttr.u32ClkSel = 0; //for sil9233 = 0;
 
-    /*设置TLV320音频解码芯片参数*/
-    Tlv320_Cfg(stAioAttr.enWorkmode,stAioAttr.enSamplerate);
+/*设置TLV320音频解码芯片参数*/
+    hink_tlv320_cfg(stAioAttr.enWorkmode,stAioAttr.enSamplerate);
 
 
     pid_t pid = fork();
@@ -253,96 +217,160 @@ int main(int argc, char *argv[])
     if(pid == 0) { // child pid to decode and play the audio data.
         ADEC_CHN    adChn = 0;
         AO_CHN aoChn = 0;
-        AUDIO_DEV aoDev = SAMPLE_AUDIO_TLV320_AO_DEV;
-        unsigned char out_buf[640] = {0};
+        AUDIO_DEV aoDev = HINK_AUDIO_TLV320_AO_DEV;
+        unsigned char out_buf[1024*4] = {0};
         unsigned int out_size = 0;
+        MPP_CHN_S stSrcChn,stDestChn;
         printf("Chirld PID to recv and decode data.\n");
-        s32Ret = ht_ao_init(aoDev,aoChn,&stAioAttr);
-        s32Ret = ht_adec_start(adChn,PT_LPCM);
+        //stAioAttr.u32PtNumPerFrm = 960;
+        s32Ret = hink_ao_init(aoDev,aoChn,&stAioAttr);
+        s32Ret = hink_adec_start(adChn,PT_LPCM);
 
-        s32Ret = ht_sys_aoBindAdec(aoDev,aoChn,adChn);
+        HINK_MPP_CHN_INIT(stSrcChn, HI_ID_ADEC, 0, adChn);
+        HINK_MPP_CHN_INIT(stDestChn, HI_ID_AO, aoDev, aoChn);
+
+        s32Ret = hink_sys_bind(&stSrcChn, &stDestChn);//ht_sys_aoBindAdec(aoDev,aoChn,adChn);
 
         int sock = nn_socket(AF_SP, NN_PULL);
         assert(sock >= 0);
         assert(nn_bind(sock, NN_URL) >= 0);
-        while (1) {
+        while (bStart) {
             unsigned char *buf = NULL;
             int bytes = nn_recv(sock, &buf, NN_MSG, 0);
-            assert(bytes >= 0);
-            if(bytes == 2 && buf[0]== 'q'){
+
+
+            if((bytes == 2 && buf[0]== 'q')){
+                printf("[DBG]  child recv q L%d\n",__LINE__);
                 break;
-            }else {
+            }
+
+            else {
                 AUDIO_STREAM_S stStream;
 
-#if defined (CODEC_G729)
+#if defined (SEND_ENCODE_DATA)
+
+
+#if CODEC_TYPE == CODEC_TYPE_G729
                 out_size = g729_decode(g729_codec, out_buf, buf, bytes);
                 /* printf("[INFO] %s:L%d@%s,out_size = %d.\n",__FUNCTION__,__LINE__,__FILE__,out_size); */
                 stStream.pStream = out_buf;//TODO:
                 stStream.u32Len = out_size;
-#else //CODEC PCM
+#elif CODEC_TYPE == CODEC_TYPE_OPUS
+                out_size = mopus_decode(opus_codec, out_buf, buf, bytes);//g729_decode(g729_codec, out_buf, buf, bytes);
+                if((audio_tick++ % 100) == 0)
+                    printf("[INFO] %s:L%d@%s,decode out_size = %d.\n",__FUNCTION__,__LINE__,__FILE__,out_size);
+                stStream.pStream = out_buf;//TODO:
+                stStream.u32Len = out_size ;
+
+#endif
+
+#else //!SEND_ENCODE_DATA
                 stStream.pStream = buf;//TODO:
                 stStream.u32Len = bytes;
-#endif /*CODEC_G729*/
+#endif /*SEND_ENCODE_DATA*/
                 s32Ret = HI_MPI_ADEC_SendStream(adChn, &stStream, HI_TRUE);
                 if (HI_SUCCESS != s32Ret ){
                     printf("[ERR]%s:L%d, HI_MPI_ADEC_SendStream(%d), failed with %#x!\n", \
                            __FUNCTION__,__LINE__, adChn, s32Ret);
+                    nn_freemsg(buf);
+                    continue;
                 }
             }
+
             nn_freemsg(buf);
         }
 
-        s32Ret = ht_sys_aoUnBindAdec(aoDev, aoChn, adChn);
-        s32Ret = ht_ao_uninit(aoDev, aoChn);
+        /* s32Ret = hink_sys_unBind(&stSrcChn, &stDestChn); *///ht_sys_aoUnBindAdec(aoDev, aoChn, adChn);
+
         nn_shutdown(sock, 0);
-        printf("Child exit!\n");
+        printf("*************************Child exit!\n");
         exit(0);
     }else {
         printf("Parent PID to encoder and send to adec.\n");
+        /* Setup signal handlers */
+        signal(SIGINT, &sig_handler);
+        signal(SIGTERM, &sig_handler);
+        signal(SIGPIPE, SIG_IGN);
+
     }
 
-    s32Ret = ht_ai_init(aiDev,aiChn,&stAioAttr,AUDIO_SAMPLE_RATE_BUTT);
-
-
-    s32Ret = ht_aenc_start(aeChn,&stAioAttr,/* PT_G711U */PT_LPCM);
-
-    s32Ret = ht_sys_aencBindAi(aeChn,aiDev,aiChn);
+    s32Ret = hink_ai_init(aiDev,aiChn,&stAioAttr,AUDIO_SAMPLE_RATE_BUTT);
 
 
 
 
-    memcpy(my_aenc.file_name, strchr(argv[0], '/') + 1, strlen(argv[0]) - (strchr(argv[0], '/') - argv[0] - 1));
-    //printf("%s:%d\n", my_aenc.file_name,strlen(argv[0]));
-    my_aenc.AeChn = aeChn;
-    my_aenc.bStart = HI_TRUE;
-    my_aenc.pfd = NULL;
+    hink_aenc_t stAenc;
+    stAenc.bufSize = 30;
+    stAenc.payload = PT_LPCM;
+    stAenc.aeChn = aeChn;
+    stAenc.pstAioAttr = &stAioAttr;
+
+    s32Ret = hink_aenc_start(&stAenc);
+
+    MPP_CHN_S stAeChn,stAiChn;
+    HINK_MPP_CHN_INIT(stAeChn, HI_ID_AENC, 0, aeChn);
+    HINK_MPP_CHN_INIT(stAiChn, HI_ID_AI, aiDev, aiChn);
+
+    s32Ret = hink_sys_bind(&stAiChn, &stAeChn);//ht_sys_aencBindAi(aeChn,aiDev,aiChn);
 
     int push_sock = nn_socket(AF_SP, NN_PUSH);
     assert(push_sock >= 0);
     assert(nn_connect(push_sock, NN_URL) >= 0);
 
-    my_aenc.sock = push_sock;
 
 
-    pthread_create(&my_aenc.stAencPid,0,audio_aencProc,&my_aenc);
 
+    hink_aenc_recv_t *pst = calloc(sizeof(hink_aenc_recv_t), 1);
 
+    if(pst == NULL){
+        printf("%s\n", "MEMO ERROR!");
+        return -1;
+    }
+    memcpy(ctx.file, strchr(argv[0], '/') + 1, strlen(argv[0]) - (strchr(argv[0], '/') - argv[0] - 1));
+    ctx.push_socket = push_sock;
+    pst->s32Cnt = 1;
+    pst->aeChn[0] = 0;
+    pst->uargs = &ctx;
+    pst->cb = aenc_callback;
+    hink_aenc_recv(pst);
 
     printf("`Ctrl + C` to quit.\n");
 
-    while(my_aenc.bStart == HI_TRUE){
-        usleep(500);
+    while(bStart){
+
+        sleep(1);
+        /* int bytes = nn_send(push_sock, "q", 2, 0); */
     }
 
 
+    printf("[DBG] L%d\n",__LINE__);
     int bytes = nn_send(push_sock, "q", 2, 0);
-    sleep(1);
+    usleep(500);
+    printf("[DBG] L%d\n",__LINE__);
+    hink_aenc_dest(pst);
+    hink_sys_unBind(&stAiChn, &stAeChn);
+    printf("[DBG] L%d\n",__LINE__);
+    if(ctx.pPFile){
+        fclose(ctx.pPFile);
+    }
+    if(ctx.pGFile){
+        fclose(ctx.pGFile);
+    }
+    printf("[DBG] L%d\n",__LINE__);
+    free(pst);
+    printf("[DBG] L%d\n",__LINE__);
     if(g729_codec != NULL)
         g729_destroy(g729_codec);
-    ht_ai_uninit(aiDev, aiChn);
 
-    ht_sys_unInit();
+    if(opus_codec != NULL)
+        mopus_destroy(opus_codec);
+
+    printf("[DBG] L%d\n",__LINE__);
+    hink_ai_uninit(aiDev, aiChn);
+    printf("[DBG] L%d\n",__LINE__);
+    hink_sys_unInit();
+    printf("[DBG] L%d\n",__LINE__);
     nn_shutdown(push_sock, 0);
-
+    printf("[DBG] L%d\n",__LINE__);
     return 0;
 }
